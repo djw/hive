@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
+	"time"
 )
 
 type Client struct {
@@ -17,46 +18,41 @@ type Client struct {
 type credentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
-	Caller   string `json:"caller"`
-}
-
-type payload struct {
-	Sessions []credentials `json:"sessions"`
-}
-
-type sessions struct {
-	SessionID string `json:"sessionId"`
+	Redirect string
 }
 
 type payloadResponse struct {
-	Sessions []sessions `json:"sessions"`
+	Location string
 }
 
-func (c *Client) GetSession() error {
-	// fmt.Println("Getting new session token")
+type DataPoint struct {
+	Date        string
+	Temperature float32
+}
+
+type historyResponse struct {
+	Data []DataPoint `json:"data"`
+}
+
+type Product struct {
+	Id string `json:"id"`
+}
+
+func (c *Client) getSession() error {
 	client := &http.Client{}
 
 	var creds = credentials{
 		Username: c.Username,
 		Password: c.Password,
-		Caller:   "WEB",
+		Redirect: "https://my.hivehome.com",
 	}
 
-	var p = payload{
-		Sessions: []credentials{creds},
-	}
-
-	data, err := json.Marshal(p)
+	data, err := json.Marshal(creds)
 	if err != nil {
-		log.Fatalf("JSON Marshal error: %s", err)
+		return err
 	}
 
-	u := bytes.NewReader(data)
-
-	req, _ := http.NewRequest("POST", "https://api-prod.bgchprod.info:443/omnia/auth/sessions", u)
-	req.Header.Set("Content-Type", "application/vnd.alertme.zoo-6.1+json")
-	req.Header.Set("Accept", "application/vnd.alertme.zoo-6.1+json")
-	req.Header.Set("X-Omnia-Client", "Hive Web Dashboard")
+	req, _ := http.NewRequest("POST", "https://sso.hivehome.com/auth/login?client=v3-web-prod", bytes.NewBuffer(data))
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -64,41 +60,70 @@ func (c *Client) GetSession() error {
 	}
 	defer resp.Body.Close()
 
-	var sessions payloadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&sessions); err != nil {
+	var payload payloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	}
+
+	parsedLocation, err := url.Parse(payload.Location)
+	if err != nil {
 		return err
 	}
-	c.sessionID = sessions.Sessions[0].SessionID
+
+	m, err := url.ParseQuery(parsedLocation.Fragment)
+
+	if err != nil {
+		return err
+	}
+
+	c.sessionID = m.Get("id_token")
+
 	return nil
 }
 
-func (c *Client) GetData() error {
+func (c *Client) getProducts() ([]Product, error) {
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", "https://beekeeper-uk.hivehome.com/1.0/products?after=", nil)
+	req.Header.Set("authorization", c.sessionID)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var products []Product
+	if err := json.NewDecoder(resp.Body).Decode(&products); err != nil {
+	}
+	return products, nil
+}
+
+func (c *Client) GetData(start time.Time, end time.Time) ([]DataPoint, error) {
 	if c.sessionID == "" {
-		err := c.GetSession()
+		err := c.getSession()
 		if err != nil {
 			log.Fatalf("Error getting session token: %s", err)
 		}
 	}
+
 	client := &http.Client{}
 
-	req, _ := http.NewRequest("GET", "https://api-prod.bgchprod.info:443/omnia/nodes", nil)
-	req.Header.Set("Content-Type", "application/vnd.alertme.zoo-6.1+json")
-	req.Header.Set("Accept", "application/vnd.alertme.zoo-6.1+json")
-	req.Header.Set("X-Omnia-Client", "Hive Web Dashboard")
-	req.Header.Set("X-Omnia-Access-Token", c.sessionID)
+	products, _ := c.getProducts()
+	url := fmt.Sprintf("https://beekeeper-uk.hivehome.com/1.0/history/heating/%s?start=%d&end=%d&timeUnit=MINUTES&rate=30&operation=AVG", products[0].Id, start.Unix()*1000, end.Unix()*1000)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("authorization", c.sessionID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("Error 1")
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error 2")
-		return err
+	var history historyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&history); err != nil {
 	}
-	fmt.Printf("%s\n", body)
-	return nil
+
+	if err != nil {
+		return nil, err
+	}
+
+	return history.Data, nil
 }
